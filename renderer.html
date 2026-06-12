@@ -1,0 +1,400 @@
+<!--
+=========================================================
+Nombre completo: renderer.html
+Ruta o ubicación: /renderer.html
+
+Función o funciones:
+1. Mostrar la pantalla principal de AgendaJeff.
+2. Crear eventos y pendientes.
+3. Permitir carga masiva inteligente.
+4. Configurar y probar Telegram, Google Calendar, Microsoft Calendar y PC.
+5. Mantener una interfaz compacta, limpia y minimalista.
+6. Cargar estilos para tabla editable de eventos.
+
+Con qué se conecta:
+- main.js
+- preload.js
+- src/js/app.js
+- src/js/platform-service.js
+- src/css/base.css
+- src/css/layout.css
+- src/css/components.css
+- src/css/editable-table.css
+- src/css/modals.css
+
+Para qué sirve:
+Sirve como pantalla principal de la aplicación.
+=========================================================
+-->
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="
+      default-src 'self';
+      script-src 'self';
+      style-src 'self' 'unsafe-inline';
+      img-src 'self' data:;
+      connect-src 'self'
+        https://*.googleapis.com
+        https://oauth2.googleapis.com
+        https://*.firebaseio.com
+        https://*.firebase.com
+        https://firestore.googleapis.com
+        https://api.telegram.org
+        https://login.microsoftonline.com
+        https://graph.microsoft.com;
+    "
+  />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AgendaJeff</title>
+
+  <link rel="stylesheet" href="./src/css/base.css" />
+  <link rel="stylesheet" href="./src/css/layout.css" />
+  <link rel="stylesheet" href="./src/css/components.css" />
+  <link rel="stylesheet" href="./src/css/editable-table.css" />
+  <link rel="stylesheet" href="./src/css/modals.css" />
+</head>
+
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <section class="brand-area">
+        <div class="brand-logo">AJ</div>
+        <div>
+          <h1>AgendaJeff</h1>
+          <p id="appSubtitle">Agenda personal sincronizada</p>
+        </div>
+      </section>
+
+      <section class="top-actions">
+        <div class="platform-dots" aria-label="Estado de conexiones">
+          <button class="platform-dot is-offline" id="dotTelegram" title="Telegram">
+            <span>TG</span>
+          </button>
+          <button class="platform-dot is-offline" id="dotGoogle" title="Google Calendar">
+            <span>G</span>
+          </button>
+          <button class="platform-dot is-offline" id="dotMicrosoft" title="Microsoft Calendar">
+            <span>M</span>
+          </button>
+          <button class="platform-dot is-offline" id="dotDesktop" title="Notificaciones de escritorio">
+            <span>PC</span>
+          </button>
+        </div>
+
+        <button class="btn btn-primary" id="btnOpenNew">+ Nuevo</button>
+        <button class="btn btn-soft" id="btnOpenBulk">Carga masiva</button>
+        <button class="btn btn-icon" id="btnOpenConnections" title="Conexiones">I</button>
+      </section>
+    </header>
+
+    <main class="main-content">
+      <section class="summary-strip" id="summaryStrip">
+        <article class="summary-card">
+          <span class="summary-label">Hoy</span>
+          <strong id="countToday">0</strong>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">Próximos</span>
+          <strong id="countUpcoming">0</strong>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">Pendientes</span>
+          <strong id="countTasks">0</strong>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">Pasados</span>
+          <strong id="countPast">0</strong>
+        </article>
+      </section>
+
+      <section class="filters-bar" aria-label="Filtros principales">
+        <button class="filter-chip is-active" data-filter="hoy">Hoy</button>
+        <button class="filter-chip" data-filter="todos">Todos</button>
+        <button class="filter-chip" data-filter="proximos">Próximos</button>
+        <button class="filter-chip" data-filter="pendientes">Pendientes</button>
+        <button class="filter-chip" data-filter="pasados">Pasados</button>
+      </section>
+
+      <section class="list-panel">
+        <div class="list-header">
+          <div>
+            <h2 id="listTitle">Hoy</h2>
+            <p id="listDescription">Eventos y pendientes para hoy.</p>
+          </div>
+          <span class="sync-pill" id="syncStatus">Sincronización automática</span>
+        </div>
+
+        <div class="event-list" id="eventList">
+          <div class="empty-state">
+            <h3>No hay registros para mostrar</h3>
+            <p>Usa el botón “+ Nuevo” o “Carga masiva” para agregar eventos y pendientes.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="modalNew" aria-hidden="true">
+    <section class="modal-card modal-small" role="dialog" aria-modal="true">
+      <header class="modal-header">
+        <div>
+          <h2>Nuevo registro</h2>
+          <p>Crear evento o pendiente.</p>
+        </div>
+        <button class="modal-close" data-close-modal="modalNew">×</button>
+      </header>
+
+      <form class="modal-body form-grid" id="formNewItem">
+        <label>
+          Tipo
+          <select id="newType" required>
+            <option value="evento">Evento</option>
+            <option value="pendiente">Pendiente</option>
+          </select>
+        </label>
+
+        <label>
+          Título
+          <input id="newTitle" type="text" placeholder="Ej. Reunión de titulación" required />
+        </label>
+
+        <label>
+          Fecha
+          <input id="newDate" type="date" />
+        </label>
+
+        <label>
+          Hora
+          <input id="newTime" type="time" />
+        </label>
+
+        <label>
+          Etiqueta
+          <select id="newTag">
+            <option value="Trabajo">Trabajo</option>
+            <option value="Personal">Personal</option>
+            <option value="Titulación">Titulación</option>
+            <option value="Reunión">Reunión</option>
+            <option value="Urgente">Urgente</option>
+            <option value="Pago">Pago</option>
+            <option value="Académico">Académico</option>
+          </select>
+        </label>
+
+        <label>
+          Recordatorio
+          <select id="newReminder">
+            <option value="mismo_dia">Mismo día</option>
+            <option value="tres_dias_antes">3 días antes</option>
+            <option value="cinco_dias_antes">5 días antes</option>
+            <option value="hasta_completar">Hasta que se complete</option>
+          </select>
+        </label>
+
+        <label class="field-full">
+          Descripción
+          <textarea id="newDescription" rows="3" placeholder="Detalle breve del evento o pendiente" required></textarea>
+        </label>
+
+        <footer class="modal-actions">
+          <button type="button" class="btn btn-soft" data-close-modal="modalNew">Cancelar</button>
+          <button type="submit" class="btn btn-primary">Guardar</button>
+        </footer>
+      </form>
+    </section>
+  </div>
+
+  <div class="modal-backdrop" id="modalBulk" aria-hidden="true">
+    <section class="modal-card modal-large" role="dialog" aria-modal="true">
+      <header class="modal-header">
+        <div>
+          <h2>Carga masiva inteligente</h2>
+          <p>Pega texto, pega tablas o sube un archivo.</p>
+        </div>
+        <button class="modal-close" data-close-modal="modalBulk">×</button>
+      </header>
+
+      <div class="modal-body">
+        <textarea
+          class="bulk-textarea"
+          id="bulkText"
+          rows="10"
+          placeholder="Pega aquí un cronograma, tabla o listado de eventos..."
+        ></textarea>
+
+        <div class="bulk-upload-row">
+          <input id="bulkFile" type="file" accept=".xlsx,.xls,.csv,.txt,.pdf" />
+          <button class="btn btn-primary" id="btnProcessBulk">Procesar carga</button>
+        </div>
+
+        <div class="bulk-preview-box" id="bulkPreviewBox">
+          <p>La vista previa aparecerá aquí cuando se procese la información.</p>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="modal-backdrop" id="modalConnections" aria-hidden="true">
+    <section class="modal-card modal-xl" role="dialog" aria-modal="true">
+      <header class="modal-header">
+        <div>
+          <h2>Conexiones</h2>
+          <p>Configurar, guardar y probar plataformas conectadas.</p>
+        </div>
+        <button class="modal-close" data-close-modal="modalConnections">×</button>
+      </header>
+
+      <div class="modal-body connections-grid">
+        <article class="connection-card connection-card-wide" data-platform-card="telegram">
+          <div class="connection-card-head">
+            <div>
+              <h3>Telegram</h3>
+              <p>Enviar avisos y recordatorios a Telegram.</p>
+            </div>
+            <span class="status-dot is-offline" id="statusTelegramText">Desconectado</span>
+          </div>
+
+          <div class="connection-form">
+            <label class="switch-line">
+              <input type="checkbox" id="telegramEnabled" />
+              Activar Telegram
+            </label>
+
+            <label>
+              Bot token
+              <input id="telegramBotToken" type="password" placeholder="Token del bot" />
+            </label>
+
+            <label>
+              Chat ID
+              <input id="telegramChatId" type="text" placeholder="Chat ID o canal" />
+            </label>
+          </div>
+
+          <div class="connection-actions">
+            <button class="btn btn-soft" data-save-platform="telegram">Guardar</button>
+            <button class="btn btn-outline" data-test-platform="telegram">Probar</button>
+          </div>
+        </article>
+
+        <article class="connection-card connection-card-wide" data-platform-card="google">
+          <div class="connection-card-head">
+            <div>
+              <h3>Google Calendar</h3>
+              <p>Crear eventos en Google Calendar.</p>
+            </div>
+            <span class="status-dot is-offline" id="statusGoogleText">Desconectado</span>
+          </div>
+
+          <div class="connection-form">
+            <label class="switch-line">
+              <input type="checkbox" id="googleEnabled" />
+              Activar Google Calendar
+            </label>
+
+            <label>
+              Client ID
+              <input id="googleClientId" type="text" placeholder="Google Client ID" />
+            </label>
+
+            <label>
+              Client Secret
+              <input id="googleClientSecret" type="password" placeholder="Google Client Secret" />
+            </label>
+
+            <label>
+              Refresh Token
+              <input id="googleRefreshToken" type="password" placeholder="Google Refresh Token" />
+            </label>
+
+            <label>
+              Calendar ID
+              <input id="googleCalendarId" type="text" value="primary" placeholder="primary" />
+            </label>
+          </div>
+
+          <div class="connection-actions">
+            <button class="btn btn-soft" data-save-platform="google">Guardar</button>
+            <button class="btn btn-outline" data-test-platform="google">Probar</button>
+          </div>
+        </article>
+
+        <article class="connection-card connection-card-wide" data-platform-card="microsoft">
+          <div class="connection-card-head">
+            <div>
+              <h3>Microsoft Calendar</h3>
+              <p>Sincronizar con Outlook/Microsoft 365.</p>
+            </div>
+            <span class="status-dot is-offline" id="statusMicrosoftText">Desconectado</span>
+          </div>
+
+          <div class="connection-form">
+            <label class="switch-line">
+              <input type="checkbox" id="microsoftEnabled" />
+              Activar Microsoft Calendar
+            </label>
+
+            <label>
+              Tenant ID
+              <input id="microsoftTenantId" type="text" value="common" placeholder="common o tenant ID" />
+            </label>
+
+            <label>
+              Client ID
+              <input id="microsoftClientId" type="text" placeholder="Microsoft Client ID" />
+            </label>
+
+            <label>
+              Client Secret
+              <input id="microsoftClientSecret" type="password" placeholder="Microsoft Client Secret" />
+            </label>
+
+            <label>
+              Refresh Token
+              <input id="microsoftRefreshToken" type="password" placeholder="Microsoft Refresh Token" />
+            </label>
+
+            <label>
+              Usuario/correo
+              <input id="microsoftUserPrincipalName" type="text" placeholder="correo opcional" />
+            </label>
+          </div>
+
+          <div class="connection-actions">
+            <button class="btn btn-soft" data-save-platform="microsoft">Guardar</button>
+            <button class="btn btn-outline" data-test-platform="microsoft">Probar</button>
+          </div>
+        </article>
+
+        <article class="connection-card connection-card-wide" data-platform-card="desktop">
+          <div class="connection-card-head">
+            <div>
+              <h3>Notificaciones PC</h3>
+              <p>Mostrar recordatorios reales del sistema.</p>
+            </div>
+            <span class="status-dot is-offline" id="statusDesktopText">Verificando</span>
+          </div>
+
+          <div class="connection-form">
+            <label class="switch-line">
+              <input type="checkbox" id="desktopEnabled" checked />
+              Activar notificaciones de escritorio
+            </label>
+          </div>
+
+          <div class="connection-actions">
+            <button class="btn btn-soft" data-save-platform="desktop">Guardar</button>
+            <button class="btn btn-outline" data-test-platform="desktop">Probar</button>
+          </div>
+        </article>
+      </div>
+    </section>
+  </div>
+
+  <script type="module" src="./src/js/app.js"></script>
+</body>
+</html>

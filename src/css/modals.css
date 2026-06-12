@@ -1,0 +1,276 @@
+/*
+=========================================================
+Nombre completo: modals.css
+Ruta o ubicación: /src/css/modals.css
+
+Función o funciones:
+1. Mantener diseño de popups.
+2. Agregar modal amplio para conexiones.
+3. Diseñar formularios compactos por plataforma.
+
+Con qué se conecta:
+- renderer.html
+- src/js/app.js
+- src/js/platform-service.js
+
+Para qué sirve:
+Sirve para que los popups se vean organizados y fáciles de manejar.
+=========================================================
+*/
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  display: none;
+  place-items: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.38);
+  backdrop-filter: blur(10px);
+  z-index: 50;
+}
+
+.modal-backdrop.is-open {
+  display: grid;
+}
+
+.modal-card {
+  width: min(100%, 780px);
+  max-height: min(92vh, 780px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid rgba(228, 232, 240, 0.9);
+  border-radius: 24px;
+  background: var(--surface);
+  box-shadow: 0 30px 80px rgba(15, 23, 42, 0.22);
+}
+
+.modal-small {
+  width: min(100%, 560px);
+}
+
+.modal-large {
+  width: min(100%, 860px);
+}
+
+.modal-xl {
+  width: min(100%, 1040px);
+}
+
+.modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-header h2 {
+  font-size: 18px;
+  letter-spacing: -0.03em;
+}
+
+.modal-header p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.modal-close {
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  font-size: 22px;
+  line-height: 1;
+}
+
+.modal-close:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.modal-body {
+  padding: 18px 20px 20px;
+  overflow: auto;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+  gap: 13px;
+}
+
+.form-grid label,
+.connection-form label {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.field-full {
+  grid-column: 1 / -1;
+}
+
+.modal-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  padding-top: 4px;
+}
+
+.bulk-textarea {
+  min-height: 210px;
+  line-height: 1.5;
+}
+
+.bulk-upload-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-soft);
+}
+
+.bulk-upload-row input {
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.bulk-preview-box {
+  min-height: 120px;
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px dashed #d8deea;
+  border-radius: var(--radius-md);
+  background: #fbfcff;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.connections-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.connection-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: #ffffff;
+}
+
+.connection-card-wide {
+  min-width: 0;
+}
+
+.connection-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.connection-card h3 {
+  font-size: 15px;
+}
+
+.connection-card p {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.connection-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(130px, 1fr));
+  gap: 10px;
+}
+
+.connection-form input {
+  height: 36px;
+  font-size: 12px;
+}
+
+.switch-line {
+  grid-column: 1 / -1;
+  display: flex !important;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 8px !important;
+  color: var(--text) !important;
+}
+
+.switch-line input {
+  width: 16px;
+  height: 16px;
+}
+
+.connection-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.connection-card .btn {
+  min-height: 34px;
+  padding: 0 12px;
+}
+
+.status-dot {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.status-dot.is-online {
+  color: var(--success);
+  background: var(--success-soft);
+}
+
+.status-dot.is-offline {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.status-dot.is-checking {
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+
+@media (max-width: 850px) {
+  .form-grid,
+  .connections-grid,
+  .connection-form {
+    grid-template-columns: 1fr;
+  }
+
+  .bulk-upload-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .connection-card-head {
+    flex-direction: column;
+  }
+}
