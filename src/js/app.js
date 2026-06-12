@@ -7,11 +7,12 @@ Función o funciones:
 1. Iniciar AgendaJeff.
 2. Conectar UI, guardado local, Firebase, carga masiva y plataformas.
 3. Guardar primero local y luego sincronizar automáticamente.
-4. Cargar credenciales reales desde Firebase.
-5. Probar conexiones desde el popup.
-6. Completar eventos o pendientes.
-7. Editar eventos en tabla compacta sin crear duplicados.
-8. Guardar una fila o todos los cambios pendientes de edición.
+4. Guardar correctamente eventos importados por carga masiva.
+5. Evitar que eventos duplicados se guarden o se envíen a plataformas.
+6. Cargar eventos locales al abrir la app.
+7. Probar conexiones desde el popup.
+8. Completar eventos o pendientes.
+9. Mantener la edición de tabla si existe event-editor.js.
 
 Con qué se conecta:
 - renderer.html
@@ -21,7 +22,8 @@ Con qué se conecta:
 - src/js/bulk-preview.js
 - src/js/sync-service.js
 - src/js/platform-service.js
-- src/js/event-editor.js
+- src/js/duplicate-service.js
+- src/js/event-editor.js, si existe
 
 Para qué sirve:
 Sirve como controlador principal definitivo de AgendaJeff.
@@ -34,11 +36,11 @@ import {
 } from "./state.js";
 
 import {
-  initUICache,
-  renderAgendaView,
-  openModal,
+  closeAllModals,
   closeModal,
-  closeAllModals
+  initUICache,
+  openModal,
+  renderAgendaView
 } from "./ui.js";
 
 import {
@@ -46,54 +48,37 @@ import {
   completeAgendaItem
 } from "./events.js";
 
-import {
-  initBulkPreview
-} from "./bulk-preview.js";
+import { initBulkPreview } from "./bulk-preview.js";
 
 import {
+  cleanAllDuplicates,
   initSyncService,
   saveItemLocalFirst,
-  saveManyItemsLocalFirst
+  saveManyItemsLocalFirst,
+  syncNow
 } from "./sync-service.js";
 
 import {
   initPlatformService,
   loadPlatformConnections,
   saveSinglePlatformConnection,
-  testPlatformConnection,
-  syncItemToConnectedPlatforms
+  syncItemToConnectedPlatforms,
+  testPlatformConnection
 } from "./platform-service.js";
 
-import {
-  buildEditedAgendaItem,
-  cancelAllEditing,
-  cancelEditingItem,
-  findItemById,
-  finishEditingItem,
-  formatEditorErrors,
-  getDirtyItemIds,
-  getEditedItemsReadyToSave,
-  hasDraftChanges,
-  isItemBeingEdited,
-  setDraftField,
-  startEditingItem
-} from "./event-editor.js";
-
 const DOM = {};
+let editorModule = null;
 
 function cacheDOM() {
   DOM.appSubtitle = document.getElementById("appSubtitle");
-
   DOM.btnOpenNew = document.getElementById("btnOpenNew");
   DOM.btnOpenBulk = document.getElementById("btnOpenBulk");
   DOM.btnOpenConnections = document.getElementById("btnOpenConnections");
-
   DOM.formNewItem = document.getElementById("formNewItem");
   DOM.eventList = document.getElementById("eventList");
 
   DOM.filterButtons = Array.from(document.querySelectorAll(".filter-chip"));
   DOM.closeModalButtons = Array.from(document.querySelectorAll("[data-close-modal]"));
-
   DOM.savePlatformButtons = Array.from(document.querySelectorAll("[data-save-platform]"));
   DOM.testPlatformButtons = Array.from(document.querySelectorAll("[data-test-platform]"));
 }
@@ -102,19 +87,11 @@ function getTodayISO() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function setDefaultFormValues() {
-  const dateInput = document.getElementById("newDate");
-
-  if (dateInput && !dateInput.value) {
-    dateInput.value = getTodayISO();
-  }
-}
-
 function safeSetValue(elementId, value) {
   const element = document.getElementById(elementId);
 
   if (element) {
-    element.value = value;
+    element.value = value ?? "";
   }
 }
 
@@ -126,6 +103,14 @@ function safeSetChecked(elementId, checked) {
   }
 }
 
+function setDefaultFormValues() {
+  const dateInput = document.getElementById("newDate");
+
+  if (dateInput && !dateInput.value) {
+    dateInput.value = getTodayISO();
+  }
+}
+
 function getNewItemFormData() {
   return {
     type: document.getElementById("newType")?.value || "evento",
@@ -134,163 +119,242 @@ function getNewItemFormData() {
     time: document.getElementById("newTime")?.value || "",
     tag: document.getElementById("newTag")?.value || "Trabajo",
     reminder: document.getElementById("newReminder")?.value || "mismo_dia",
+    reminderTime: document.getElementById("newReminderTime")?.value || "",
     description: document.getElementById("newDescription")?.value || "",
     source: "manual"
   };
 }
 
-function getItemById(itemId) {
-  return findItemById(agendaState.items, itemId);
+function findItemById(itemId) {
+  return (agendaState.items || []).find((item) => item.id === itemId) || null;
+}
+
+async function loadOptionalEditorModule() {
+  try {
+    editorModule = await import("./event-editor.js");
+  } catch (_error) {
+    editorModule = null;
+  }
+}
+
+function editorAvailable() {
+  return Boolean(editorModule);
+}
+
+async function syncPlatformsSafely(items = []) {
+  const list = Array.isArray(items) ? items : [items];
+
+  for (const item of list) {
+    if (!item?.id || item.duplicateSkipped) {
+      continue;
+    }
+
+    try {
+      await syncItemToConnectedPlatforms(item);
+    } catch (error) {
+      console.warn("No se pudo sincronizar con plataformas externas:", item.title || item.id, error);
+    }
+  }
+
+  renderAgendaView();
+}
+
+function showDuplicateMessage(totalSkipped = 0) {
+  if (!totalSkipped) {
+    return;
+  }
+
+  const message = totalSkipped === 1
+    ? "Se omitió 1 evento repetido. La app conservó solo un registro."
+    : `Se omitieron ${totalSkipped} eventos repetidos. La app conservó solo un registro por evento.`;
+
+  console.info(message);
 }
 
 async function handleNewItemSubmit(event) {
   event.preventDefault();
 
-  const { item, validation } = buildAgendaItem(getNewItemFormData());
+  const result = buildAgendaItem(getNewItemFormData());
 
-  if (!validation.ok) {
-    alert(validation.errors.join("\n"));
+  if (!result.validation.ok) {
+    alert(result.validation.errors.join("\n"));
     return;
   }
 
-  const savedItem = await saveItemLocalFirst(item);
+  const savedItem = await saveItemLocalFirst({
+    ...result.item,
+    source: "manual"
+  });
 
   renderAgendaView();
 
-  closeModal("modalNew");
-  DOM.formNewItem.reset();
-  setDefaultFormValues();
-
-  syncItemToConnectedPlatforms(savedItem)
-    .then(() => renderAgendaView())
-    .catch(() => renderAgendaView());
-}
-
-async function handleBulkConfirmed(event) {
-  const items = event.detail?.items || [];
-
-  if (!items.length) {
+  if (savedItem.duplicateSkipped) {
+    alert("Este evento ya existe con el mismo tipo, título, fecha y hora. No se guardó duplicado.");
     return;
   }
 
-  const savedItems = await saveManyItemsLocalFirst(items);
+  closeModal("modalNew");
+
+  DOM.formNewItem?.reset();
+  setDefaultFormValues();
+
+  syncPlatformsSafely([savedItem]);
+}
+
+async function handleBulkConfirmed(event) {
+  const incomingItems = event.detail?.items || [];
+
+  if (!incomingItems.length) {
+    return;
+  }
+
+  const savedItems = await saveManyItemsLocalFirst(incomingItems.map((item) => ({
+    ...item,
+    source: item.source || "bulk"
+  })));
 
   closeModal("modalBulk");
   renderAgendaView();
 
-  for (const item of savedItems) {
-    syncItemToConnectedPlatforms(item).catch(() => {});
+  window.dispatchEvent(new CustomEvent("agendaJeff:bulk-saved", {
+    detail: {
+      items: savedItems
+    }
+  }));
+
+  if (!savedItems.length) {
+    alert("No se guardaron eventos nuevos porque todos ya existían o estaban repetidos.");
+    await cleanAllDuplicates().catch(() => {});
+    renderAgendaView();
+    return;
+  }
+
+  await syncPlatformsSafely(savedItems);
+
+  syncNow().catch(() => {});
+}
+
+async function completeItem(item) {
+  const completedItem = completeAgendaItem(item);
+  const savedItem = await saveItemLocalFirst(completedItem);
+
+  renderAgendaView();
+  syncNow().catch(() => {});
+
+  return savedItem;
+}
+
+function handleStartEdit(item) {
+  if (!editorAvailable()) {
+    alert("El módulo de edición no está disponible.");
+    return;
+  }
+
+  if (typeof editorModule.startEditingItem === "function") {
+    editorModule.startEditingItem(item);
+    renderAgendaView();
   }
 }
 
-function refreshEditorToolbarOnly() {
-  const toolbar = DOM.eventList?.querySelector(".editable-table-toolbar");
-
-  if (!toolbar) {
+function handleCancelEdit(itemId) {
+  if (!editorAvailable()) {
     return;
   }
 
-  const editingCount = DOM.eventList.querySelectorAll(".editable-row.is-editing").length;
-  const dirtyCount = getDirtyItemIds(agendaState.items).length;
-  const hint = toolbar.querySelector(".editable-table-hint");
-  const saveAllButton = toolbar.querySelector("[data-action='save-all-edits']");
-
-  if (hint) {
-    hint.textContent = `${editingCount} fila(s) en edición · ${dirtyCount} cambio(s) sin guardar`;
-  }
-
-  if (saveAllButton) {
-    saveAllButton.disabled = dirtyCount === 0;
+  if (typeof editorModule.cancelEditingItem === "function") {
+    editorModule.cancelEditingItem(itemId);
+    renderAgendaView();
   }
 }
 
-function updateRowDirtyVisual(itemId) {
-  if (!DOM.eventList) {
+function handleCancelAllEdits() {
+  if (!editorAvailable()) {
     return;
   }
 
-  const row = Array.from(DOM.eventList.querySelectorAll(".editable-row")).find((element) => {
-    return element.dataset.id === itemId;
-  });
-
-  const originalItem = getItemById(itemId);
-
-  if (!row || !originalItem) {
-    return;
+  if (typeof editorModule.cancelAllEditing === "function") {
+    editorModule.cancelAllEditing();
+    renderAgendaView();
   }
-
-  row.classList.toggle("is-dirty", hasDraftChanges(itemId, originalItem));
-  refreshEditorToolbarOnly();
 }
 
-async function saveEditedItem(itemId) {
-  const originalItem = getItemById(itemId);
-
-  if (!originalItem) {
-    alert("No se encontró el evento para guardar.");
+async function handleSaveEditedItem(item) {
+  if (!editorAvailable()) {
+    alert("El módulo de edición no está disponible.");
     return;
   }
 
-  const result = buildEditedAgendaItem(originalItem);
+  if (typeof editorModule.buildUpdatedItemFromDraft !== "function") {
+    alert("La edición no tiene constructor de borradores disponible.");
+    return;
+  }
+
+  const result = editorModule.buildUpdatedItemFromDraft(item);
+
+  if (!result.validation.ok) {
+    renderAgendaView();
+    alert(result.validation.errors.join("\n"));
+    return;
+  }
+
+  const savedItem = await saveItemLocalFirst(result.item);
+
+  if (savedItem.duplicateSkipped) {
+    alert("No se guardó la edición porque dejaría un evento duplicado.");
+    renderAgendaView();
+    return;
+  }
+
+  if (typeof editorModule.cancelEditingItem === "function") {
+    editorModule.cancelEditingItem(item.id);
+  }
+
+  renderAgendaView();
+  syncNow().catch(() => {});
+
+  return savedItem;
+}
+
+async function handleSaveAllEdits() {
+  if (!editorAvailable()) {
+    return;
+  }
+
+  if (typeof editorModule.getValidatedChangedItems !== "function") {
+    alert("La edición masiva no está disponible.");
+    return;
+  }
+
+  const result = editorModule.getValidatedChangedItems(agendaState.items || []);
 
   if (!result.ok) {
-    alert(result.errors.join("\n"));
+    const message = result.errors.map((error) => {
+      return `${error.item?.title || "Registro sin título"}: ${error.errors.join(" ")}`;
+    }).join("\n");
+
     renderAgendaView();
+    alert(message || "Hay filas con errores.");
+
     return;
   }
 
-  await saveItemLocalFirst(result.item);
-  finishEditingItem(itemId);
-  renderAgendaView();
-}
-
-async function saveAllEditedItems() {
-  const result = getEditedItemsReadyToSave(agendaState.items);
-
-  if (!result.ok) {
-    alert(formatEditorErrors(result.errors));
-    renderAgendaView();
+  if (!result.items.length) {
+    handleCancelAllEdits();
     return;
   }
 
-  if (!result.ready.length) {
-    cancelAllEditing();
-    renderAgendaView();
-    return;
+  const savedItems = await saveManyItemsLocalFirst(result.items);
+
+  if (typeof editorModule.cancelAllEditing === "function") {
+    editorModule.cancelAllEditing();
   }
 
-  await saveManyItemsLocalFirst(result.ready);
-
-  result.ready.forEach((item) => {
-    finishEditingItem(item.id);
-  });
-
-  renderAgendaView();
-}
-
-async function completeItem(itemId) {
-  const item = getItemById(itemId);
-
-  if (!item) {
-    return;
-  }
-
-  const completed = completeAgendaItem(item);
-  const savedItem = await saveItemLocalFirst(completed);
-
-  const index = agendaState.items.findIndex((record) => {
-    return record.id === itemId;
-  });
-
-  if (index >= 0) {
-    agendaState.items[index] = savedItem;
-  }
-
-  if (isItemBeingEdited(itemId)) {
-    finishEditingItem(itemId);
+  if (savedItems.length < result.items.length) {
+    alert("Algunas ediciones no se guardaron porque generaban duplicados.");
   }
 
   renderAgendaView();
+  syncNow().catch(() => {});
 }
 
 async function handleListClick(event) {
@@ -304,60 +368,73 @@ async function handleListClick(event) {
   const itemId = button.dataset.id;
 
   if (action === "save-all-edits") {
-    await saveAllEditedItems();
+    await handleSaveAllEdits();
     return;
   }
 
   if (action === "cancel-all-edits") {
-    cancelAllEditing();
+    handleCancelAllEdits();
+    return;
+  }
+
+  if (action === "clean-duplicates") {
+    const result = await cleanAllDuplicates();
     renderAgendaView();
+
+    const localStats = result.local?.stats || {};
+    const totalDeleted = Number(localStats.deleted || 0);
+
+    alert(totalDeleted > 0
+      ? `Listo. Se eliminaron ${totalDeleted} duplicados locales. También se intentó limpiar Firebase.`
+      : "Listo. No se encontraron duplicados locales."
+    );
+
     return;
   }
 
-  if (!itemId) {
-    return;
-  }
+  const item = findItemById(itemId);
 
-  const item = getItemById(itemId);
-
-  if (!item) {
+  if (!item && itemId) {
     return;
   }
 
   if (action === "complete") {
-    await completeItem(itemId);
+    await completeItem(item);
     return;
   }
 
   if (action === "edit") {
-    startEditingItem(item);
-    renderAgendaView();
+    handleStartEdit(item);
     return;
   }
 
   if (action === "cancel-edit") {
-    cancelEditingItem(itemId);
-    renderAgendaView();
+    handleCancelEdit(itemId);
     return;
   }
 
   if (action === "save-edit") {
-    await saveEditedItem(itemId);
+    await handleSaveEditedItem(item);
   }
 }
 
 function handleListInput(event) {
-  const field = event.target.closest("[data-editor-field]");
+  const field = event.target?.dataset?.editField;
+  const itemId = event.target?.dataset?.id;
 
-  if (!field) {
+  if (!field || !itemId || !editorAvailable()) {
     return;
   }
 
-  const itemId = field.dataset.id;
-  const fieldName = field.dataset.editorField;
+  if (typeof editorModule.updateDraftField === "function") {
+    editorModule.updateDraftField(itemId, field, event.target.value);
 
-  setDraftField(itemId, fieldName, field.value);
-  updateRowDirtyVisual(itemId);
+    const row = event.target.closest(".editable-row");
+
+    if (row) {
+      row.classList.add("is-dirty");
+    }
+  }
 }
 
 function getPlatformFormData(platformName) {
@@ -401,7 +478,6 @@ function getPlatformFormData(platformName) {
 
 function fillPlatformForms() {
   const connections = agendaState.connections || {};
-
   const telegram = connections.telegram || {};
   const google = connections.google || {};
   const microsoft = connections.microsoft || {};
@@ -445,38 +521,27 @@ function updateConnectionText(platformName, status, message = "") {
 
   if (status === "online") {
     element.classList.add("is-online");
-    element.textContent = "Conectado";
-  } else if (status === "checking") {
-    element.classList.add("is-checking");
-    element.textContent = message || "Cargando";
-  } else {
-    element.classList.add("is-offline");
-    element.textContent = message || "Desconectado";
+    element.textContent = message || "Conectado";
+    return;
   }
+
+  if (status === "checking") {
+    element.classList.add("is-checking");
+    element.textContent = message || "Probando";
+    return;
+  }
+
+  element.classList.add("is-offline");
+  element.textContent = message || "Desconectado";
 }
 
 function updateConnectionTextsFromLoadedData() {
   const connections = agendaState.connections || {};
 
-  updateConnectionText(
-    "telegram",
-    connections.telegram?.enabled ? "online" : "offline"
-  );
-
-  updateConnectionText(
-    "google",
-    connections.google?.enabled ? "online" : "offline"
-  );
-
-  updateConnectionText(
-    "microsoft",
-    connections.microsoft?.enabled ? "online" : "offline"
-  );
-
-  updateConnectionText(
-    "desktop",
-    connections.desktop?.enabled !== false ? "online" : "offline"
-  );
+  updateConnectionText("telegram", connections.telegram?.enabled ? "online" : "offline");
+  updateConnectionText("google", connections.google?.enabled ? "online" : "offline");
+  updateConnectionText("microsoft", connections.microsoft?.enabled ? "online" : "offline");
+  updateConnectionText("desktop", connections.desktop?.enabled !== false ? "online" : "offline");
 }
 
 async function openConnectionsModal() {
@@ -509,11 +574,7 @@ async function handleSavePlatform(event) {
   updateConnectionTextsFromLoadedData();
   renderAgendaView();
 
-  updateConnectionText(
-    platformName,
-    savedConfig.enabled ? "online" : "offline",
-    "Guardado"
-  );
+  updateConnectionText(platformName, savedConfig.enabled ? "online" : "offline", "Guardado");
 }
 
 async function handleTestPlatform(event) {
@@ -548,10 +609,10 @@ async function loadAppInfo() {
 }
 
 function bindEvents() {
-  DOM.btnOpenNew.addEventListener("click", () => openModal("modalNew"));
-  DOM.btnOpenBulk.addEventListener("click", () => openModal("modalBulk"));
+  DOM.btnOpenNew?.addEventListener("click", () => openModal("modalNew"));
+  DOM.btnOpenBulk?.addEventListener("click", () => openModal("modalBulk"));
 
-  DOM.btnOpenConnections.addEventListener("click", () => {
+  DOM.btnOpenConnections?.addEventListener("click", () => {
     openConnectionsModal().catch((error) => {
       console.error(error);
       fillPlatformForms();
@@ -579,10 +640,10 @@ function bindEvents() {
     });
   });
 
-  DOM.formNewItem.addEventListener("submit", handleNewItemSubmit);
-  DOM.eventList.addEventListener("click", handleListClick);
-  DOM.eventList.addEventListener("input", handleListInput);
-  DOM.eventList.addEventListener("change", handleListInput);
+  DOM.formNewItem?.addEventListener("submit", handleNewItemSubmit);
+  DOM.eventList?.addEventListener("click", handleListClick);
+  DOM.eventList?.addEventListener("input", handleListInput);
+  DOM.eventList?.addEventListener("change", handleListInput);
 
   DOM.savePlatformButtons.forEach((button) => {
     button.addEventListener("click", handleSavePlatform);
@@ -595,6 +656,22 @@ function bindEvents() {
   window.addEventListener("agendaJeff:bulk-confirmed", handleBulkConfirmed);
   window.addEventListener("agendaJeff:synced", renderAgendaView);
   window.addEventListener("agendaJeff:offline", renderAgendaView);
+  window.addEventListener("agendaJeff:local-saved", renderAgendaView);
+  window.addEventListener("agendaJeff:local-saved-many", (event) => {
+    const stats = event.detail?.duplicateStats;
+
+    if (stats?.skipped) {
+      showDuplicateMessage(stats.skipped);
+    }
+
+    renderAgendaView();
+  });
+
+  window.addEventListener("agendaJeff:duplicates-skipped", (event) => {
+    const skipped = event.detail?.stats?.skipped || 0;
+
+    showDuplicateMessage(skipped);
+  });
 }
 
 async function initApp() {
@@ -607,8 +684,16 @@ async function initApp() {
 
   renderAgendaView();
 
+  await loadOptionalEditorModule();
   await loadAppInfo();
+
   await initSyncService();
+  await cleanAllDuplicates().catch((error) => {
+    console.warn("No se pudo limpiar duplicados al iniciar.", error);
+  });
+
+  renderAgendaView();
+
   await initPlatformService();
 
   fillPlatformForms();

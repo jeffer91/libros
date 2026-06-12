@@ -10,11 +10,13 @@ Función o funciones:
 4. Guardar eventos en subcolección agenda_eventos.
 5. Guardar configuraciones y conexiones sin romper la estructura existente.
 6. Evitar que la app se quede congelada si Firebase tarda demasiado.
+7. Borrar duplicados de Firebase en lote.
 
 Con qué se conecta:
 - src/js/firebase-config.js
 - src/js/sync-service.js
 - src/js/platform-service.js
+- src/js/duplicate-service.js
 - Firebase Firestore
 
 Para qué sirve:
@@ -24,7 +26,6 @@ Sirve como capa central de comunicación con Firebase.
 
 import {
   FIREBASE_CONFIG,
-  FIREBASE_PATHS,
   isFirebaseConfigured,
   getFirestoreBaseURL,
   getPrincipalDocumentPath,
@@ -34,7 +35,7 @@ import {
   getVerificationDocumentPath
 } from "./firebase-config.js";
 
-const FIREBASE_TIMEOUT_MS = 8000;
+const FIREBASE_TIMEOUT_MS = 10000;
 
 export function buildFirebaseURL(path, extraParams = {}) {
   const base = getFirestoreBaseURL();
@@ -55,9 +56,15 @@ export function buildFirebaseURL(path, extraParams = {}) {
   Object.entries(extraParams || {}).forEach(([key, value]) => {
     if (Array.isArray(value)) {
       value.forEach((item) => {
-        params.append(key, item);
+        if (item !== undefined && item !== null && item !== "") {
+          params.append(key, item);
+        }
       });
-    } else if (value !== undefined && value !== null) {
+
+      return;
+    }
+
+    if (value !== undefined && value !== null && value !== "") {
       params.set(key, value);
     }
   });
@@ -65,52 +72,130 @@ export function buildFirebaseURL(path, extraParams = {}) {
   return `${base}/${safePath}?${params.toString()}`;
 }
 
-export function toFirestoreValue(value) {
+function withTimeout(promise, timeoutMs = FIREBASE_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("Firebase tardó demasiado en responder."));
+    }, timeoutMs);
+
+    promise
+      .then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      })
+      .catch((error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+  });
+}
+
+async function firebaseRequest(path, options = {}, extraParams = {}) {
+  if (!isFirebaseConfigured()) {
+    throw new Error("Firebase no está configurado.");
+  }
+
+  const url = buildFirebaseURL(path, extraParams);
+
+  if (!url) {
+    throw new Error("No se pudo construir la URL de Firebase.");
+  }
+
+  const response = await withTimeout(fetch(url, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  }));
+
+  if (!response.ok) {
+    let detail = "";
+
+    try {
+      const errorBody = await response.json();
+      detail = errorBody?.error?.message || "";
+    } catch (_error) {
+      detail = await response.text().catch(() => "");
+    }
+
+    throw new Error(detail || `Firebase respondió con estado ${response.status}.`);
+  }
+
+  if (response.status === 204) {
+    return null;
+  }
+
+  const text = await response.text();
+
+  if (!text) {
+    return null;
+  }
+
+  return JSON.parse(text);
+}
+
+function jsToFirestoreValue(value) {
   if (value === null || value === undefined) {
-    return { nullValue: null };
+    return {
+      nullValue: null
+    };
   }
 
   if (typeof value === "string") {
-    return { stringValue: value };
+    return {
+      stringValue: value
+    };
   }
 
   if (typeof value === "number") {
-    return Number.isInteger(value)
-      ? { integerValue: String(value) }
-      : { doubleValue: value };
+    if (Number.isInteger(value)) {
+      return {
+        integerValue: String(value)
+      };
+    }
+
+    return {
+      doubleValue: value
+    };
   }
 
   if (typeof value === "boolean") {
-    return { booleanValue: value };
+    return {
+      booleanValue: value
+    };
   }
 
   if (Array.isArray(value)) {
     return {
       arrayValue: {
-        values: value.map(toFirestoreValue)
+        values: value.map(jsToFirestoreValue)
       }
     };
   }
 
   if (typeof value === "object") {
+    const fields = {};
+
+    Object.entries(value).forEach(([key, childValue]) => {
+      if (childValue !== undefined) {
+        fields[key] = jsToFirestoreValue(childValue);
+      }
+    });
+
     return {
       mapValue: {
-        fields: toFirestoreFields(value)
+        fields
       }
     };
   }
 
-  return { stringValue: String(value) };
+  return {
+    stringValue: String(value)
+  };
 }
 
-export function toFirestoreFields(data = {}) {
-  return Object.entries(data || {}).reduce((fields, [key, value]) => {
-    fields[key] = toFirestoreValue(value);
-    return fields;
-  }, {});
-}
-
-export function fromFirestoreValue(value = {}) {
+function firestoreValueToJS(value = {}) {
   if ("stringValue" in value) {
     return value.stringValue;
   }
@@ -131,280 +216,355 @@ export function fromFirestoreValue(value = {}) {
     return null;
   }
 
+  if ("timestampValue" in value) {
+    return value.timestampValue;
+  }
+
   if ("arrayValue" in value) {
-    return (value.arrayValue.values || []).map(fromFirestoreValue);
+    return (value.arrayValue.values || []).map(firestoreValueToJS);
   }
 
   if ("mapValue" in value) {
-    return fromFirestoreFields(value.mapValue.fields || {});
+    const result = {};
+
+    Object.entries(value.mapValue.fields || {}).forEach(([key, childValue]) => {
+      result[key] = firestoreValueToJS(childValue);
+    });
+
+    return result;
   }
 
   return null;
 }
 
-export function fromFirestoreFields(fields = {}) {
-  return Object.entries(fields || {}).reduce((data, [key, value]) => {
-    data[key] = fromFirestoreValue(value);
-    return data;
-  }, {});
+function jsObjectToFirestoreFields(data = {}) {
+  const fields = {};
+
+  Object.entries(data || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      fields[key] = jsToFirestoreValue(value);
+    }
+  });
+
+  return fields;
 }
 
-export function fromFirestoreDocument(document = {}) {
-  const fields = fromFirestoreFields(document.fields || {});
+function firestoreDocumentToObject(document = {}) {
+  const result = {};
+
+  Object.entries(document.fields || {}).forEach(([key, value]) => {
+    result[key] = firestoreValueToJS(value);
+  });
+
   const nameParts = String(document.name || "").split("/");
-  const documentId = nameParts[nameParts.length - 1];
+  const id = result.id || nameParts[nameParts.length - 1] || "";
 
   return {
-    id: fields.id || documentId,
-    ...fields,
-    firebaseName: document.name || "",
-    firebaseCreateTime: document.createTime || "",
-    firebaseUpdateTime: document.updateTime || ""
+    id,
+    ...result
   };
 }
 
-export async function firebaseRequest(url, options = {}) {
-  if (!isFirebaseConfigured()) {
-    throw new Error("Firebase todavía no está configurado.");
-  }
+function buildUpdateMask(data = {}) {
+  return Object.keys(data || {})
+    .filter((key) => key && data[key] !== undefined)
+    .map((key) => `updateMask.fieldPaths=${encodeURIComponent(key)}`)
+    .join("&");
+}
 
-  if (!url) {
-    throw new Error("La URL de Firebase está vacía.");
-  }
+async function patchDocument(path, data = {}) {
+  const cleanData = {
+    ...data,
+    updatedAt: data.updatedAt || new Date().toISOString()
+  };
 
-  const {
-    timeoutMs = FIREBASE_TIMEOUT_MS,
-    headers = {},
-    ...fetchOptions
-  } = options;
+  const body = {
+    fields: jsObjectToFirestoreFields(cleanData)
+  };
 
-  const controller = new AbortController();
+  const mask = buildUpdateMask(cleanData);
+  const urlPath = path;
 
-  const timer = setTimeout(() => {
-    controller.abort();
-  }, timeoutMs);
+  const result = await firebaseRequest(urlPath, {
+    method: "PATCH",
+    body: JSON.stringify(body)
+  }, {});
+
+  return firestoreDocumentToObject(result);
+}
+
+export async function verifyFirebaseConnection() {
+  const path = getVerificationDocumentPath();
 
   try {
-    const response = await fetch(url, {
-      ...fetchOptions,
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        ...headers
-      }
+    await firebaseRequest(path, {
+      method: "GET"
     });
 
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      const message = data?.error?.message || "Error de comunicación con Firebase.";
-      throw new Error(message);
-    }
-
-    return data;
+    return {
+      ok: true,
+      message: "Firebase conectado correctamente."
+    };
   } catch (error) {
-    if (error?.name === "AbortError") {
-      throw new Error("Firebase tardó demasiado en responder.");
-    }
-
-    throw error;
-  } finally {
-    clearTimeout(timer);
+    return {
+      ok: false,
+      message: error.message || "No se pudo conectar con Firebase."
+    };
   }
 }
 
-export async function getPrincipalDocument() {
-  const url = buildFirebaseURL(getPrincipalDocumentPath());
-  const response = await firebaseRequest(url, {
+export async function getImportantDocument() {
+  const document = await firebaseRequest(getPrincipalDocumentPath(), {
     method: "GET"
   });
 
-  return fromFirestoreDocument(response);
+  return firestoreDocumentToObject(document);
 }
 
 export async function getImportantData() {
-  const principal = await getPrincipalDocument();
+  const document = await getImportantDocument();
 
-  if (
-    principal &&
-    principal[FIREBASE_PATHS.importantMapField] &&
-    typeof principal[FIREBASE_PATHS.importantMapField] === "object"
-  ) {
-    return principal[FIREBASE_PATHS.importantMapField];
+  if (document.datos && typeof document.datos === "object") {
+    return document.datos;
   }
 
-  if (principal && principal.datos && typeof principal.datos === "object") {
-    return principal.datos;
-  }
-
-  return {};
+  return document;
 }
 
 export async function updateImportantDataPatch(patch = {}) {
-  const current = await getPrincipalDocument().catch(() => ({}));
-  const currentData = current[FIREBASE_PATHS.importantMapField] || current.datos || {};
-
-  const updatedData = {
+  const currentData = await getImportantData().catch(() => ({}));
+  const nextData = {
     ...currentData,
     ...patch
   };
 
-  const payload = {
-    fields: toFirestoreFields({
-      actualizadoEn: new Date().toISOString(),
-      datos: updatedData,
-      proyecto: FIREBASE_CONFIG.projectId,
-      modoGuardado: "electron-json",
-      tipo: "datos_importantes"
-    })
-  };
-
-  const url = buildFirebaseURL(getPrincipalDocumentPath(), {
-    "updateMask.fieldPaths": [
-      "actualizadoEn",
-      "datos",
-      "proyecto",
-      "modoGuardado",
-      "tipo"
-    ]
+  return patchDocument(getPrincipalDocumentPath(), {
+    datos: nextData,
+    updatedAt: new Date().toISOString()
   });
-
-  const response = await firebaseRequest(url, {
-    method: "PATCH",
-    body: JSON.stringify(payload)
-  });
-
-  return fromFirestoreDocument(response);
-}
-
-export async function verifyFirebaseWrite() {
-  const payload = {
-    fields: toFirestoreFields({
-      ok: true,
-      mensaje: "Firebase guarda correctamente desde AgendaJeff",
-      ruta: getVerificationDocumentPath(),
-      proyecto: FIREBASE_CONFIG.projectId,
-      modoGuardado: "electron-json",
-      actualizadoEn: new Date().toISOString()
-    })
-  };
-
-  const url = buildFirebaseURL(getVerificationDocumentPath());
-
-  const response = await firebaseRequest(url, {
-    method: "PATCH",
-    body: JSON.stringify(payload)
-  });
-
-  return fromFirestoreDocument(response);
-}
-
-export async function upsertFirebaseItem(item) {
-  const path = `${getItemsCollectionPath()}/${item.id}`;
-  const url = buildFirebaseURL(path);
-
-  const payload = {
-    fields: toFirestoreFields({
-      ...item,
-      firebaseSyncedAt: new Date().toISOString()
-    })
-  };
-
-  const response = await firebaseRequest(url, {
-    method: "PATCH",
-    body: JSON.stringify(payload)
-  });
-
-  return fromFirestoreDocument(response);
-}
-
-export async function deleteFirebaseItem(itemId) {
-  const path = `${getItemsCollectionPath()}/${itemId}`;
-  const url = buildFirebaseURL(path);
-
-  await firebaseRequest(url, {
-    method: "DELETE"
-  });
-
-  return true;
 }
 
 export async function getFirebaseItems() {
-  const url = buildFirebaseURL(getItemsCollectionPath());
+  const collectionPath = getItemsCollectionPath();
+  const allItems = [];
+  let pageToken = "";
 
-  try {
-    const response = await firebaseRequest(url, {
+  do {
+    const params = {
+      pageSize: 300
+    };
+
+    if (pageToken) {
+      params.pageToken = pageToken;
+    }
+
+    const result = await firebaseRequest(collectionPath, {
       method: "GET"
+    }, params);
+
+    const documents = Array.isArray(result?.documents) ? result.documents : [];
+
+    documents.forEach((document) => {
+      const item = firestoreDocumentToObject(document);
+
+      if (item.id) {
+        allItems.push(item);
+      }
     });
 
-    return (response.documents || []).map(fromFirestoreDocument);
+    pageToken = result?.nextPageToken || "";
+  } while (pageToken);
+
+  return allItems;
+}
+
+export async function upsertFirebaseItem(item = {}) {
+  if (!item.id) {
+    throw new Error("No se puede guardar en Firebase un evento sin id.");
+  }
+
+  const path = `${getItemsCollectionPath()}/${item.id}`;
+
+  const payload = {
+    ...item,
+    updatedAt: item.updatedAt || new Date().toISOString()
+  };
+
+  return patchDocument(path, payload);
+}
+
+export async function saveManyFirebaseItems(items = []) {
+  const savedItems = [];
+
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item?.id) {
+      continue;
+    }
+
+    const savedItem = await upsertFirebaseItem(item);
+    savedItems.push(savedItem);
+  }
+
+  return savedItems;
+}
+
+export async function deleteFirebaseItem(itemId) {
+  if (!itemId) {
+    return false;
+  }
+
+  const path = `${getItemsCollectionPath()}/${itemId}`;
+
+  try {
+    await firebaseRequest(path, {
+      method: "DELETE"
+    });
+
+    return true;
   } catch (error) {
     if (String(error.message || "").includes("NOT_FOUND")) {
-      return [];
+      return true;
     }
 
     throw error;
   }
 }
 
+export async function deleteManyFirebaseItems(itemIds = []) {
+  const ids = Array.from(new Set((Array.isArray(itemIds) ? itemIds : []).filter(Boolean)));
+  const result = {
+    ok: true,
+    deleted: 0,
+    failed: []
+  };
+
+  for (const itemId of ids) {
+    try {
+      await deleteFirebaseItem(itemId);
+      result.deleted += 1;
+    } catch (error) {
+      result.ok = false;
+      result.failed.push({
+        id: itemId,
+        error: error.message || "No se pudo eliminar de Firebase."
+      });
+    }
+  }
+
+  return result;
+}
+
 export async function saveFirebaseSetting(key, value) {
+  if (!key) {
+    throw new Error("No se puede guardar configuración sin clave.");
+  }
+
   const path = `${getSettingsCollectionPath()}/${key}`;
-  const url = buildFirebaseURL(path);
 
-  const payload = {
-    fields: toFirestoreFields({
-      key,
-      value,
-      updatedAt: new Date().toISOString()
-    })
-  };
-
-  const response = await firebaseRequest(url, {
-    method: "PATCH",
-    body: JSON.stringify(payload)
+  return patchDocument(path, {
+    key,
+    value,
+    updatedAt: new Date().toISOString()
   });
-
-  return fromFirestoreDocument(response);
 }
 
-export async function getFirebaseSetting(key) {
-  const path = `${getSettingsCollectionPath()}/${key}`;
-  const url = buildFirebaseURL(path);
+export async function getFirebaseSetting(key, fallback = null) {
+  if (!key) {
+    return fallback;
+  }
 
-  const response = await firebaseRequest(url, {
-    method: "GET"
-  });
+  try {
+    const document = await firebaseRequest(`${getSettingsCollectionPath()}/${key}`, {
+      method: "GET"
+    });
 
-  return fromFirestoreDocument(response);
+    const record = firestoreDocumentToObject(document);
+
+    return record.value ?? fallback;
+  } catch (error) {
+    if (String(error.message || "").includes("NOT_FOUND")) {
+      return fallback;
+    }
+
+    throw error;
+  }
 }
 
-export async function saveFirebaseConnection(platformName, connectionData = {}) {
+export async function saveFirebaseConnection(platformName, config = {}) {
+  if (!platformName) {
+    throw new Error("No se puede guardar una conexión sin nombre de plataforma.");
+  }
+
   const path = `${getConnectionsCollectionPath()}/${platformName}`;
-  const url = buildFirebaseURL(path);
 
-  const payload = {
-    fields: toFirestoreFields({
-      platformName,
-      ...connectionData,
-      updatedAt: new Date().toISOString()
-    })
-  };
-
-  const response = await firebaseRequest(url, {
-    method: "PATCH",
-    body: JSON.stringify(payload)
+  return patchDocument(path, {
+    platformName,
+    ...config,
+    updatedAt: new Date().toISOString()
   });
-
-  return fromFirestoreDocument(response);
 }
 
-export async function getFirebaseConnection(platformName) {
-  const path = `${getConnectionsCollectionPath()}/${platformName}`;
-  const url = buildFirebaseURL(path);
+export async function getFirebaseConnection(platformName, fallback = null) {
+  if (!platformName) {
+    return fallback;
+  }
 
-  const response = await firebaseRequest(url, {
+  try {
+    const document = await firebaseRequest(`${getConnectionsCollectionPath()}/${platformName}`, {
+      method: "GET"
+    });
+
+    return firestoreDocumentToObject(document);
+  } catch (error) {
+    if (String(error.message || "").includes("NOT_FOUND")) {
+      return fallback;
+    }
+
+    throw error;
+  }
+}
+
+export async function getAllFirebaseConnections() {
+  const collectionPath = getConnectionsCollectionPath();
+  const result = await firebaseRequest(collectionPath, {
     method: "GET"
+  }, {
+    pageSize: 100
   });
 
-  return fromFirestoreDocument(response);
+  const documents = Array.isArray(result?.documents) ? result.documents : [];
+  const connections = {};
+
+  documents.forEach((document) => {
+    const connection = firestoreDocumentToObject(document);
+    const platformName = connection.platformName || connection.id;
+
+    if (platformName) {
+      connections[platformName] = connection;
+    }
+  });
+
+  return connections;
+}
+
+export async function deleteFirebaseConnection(platformName) {
+  if (!platformName) {
+    return false;
+  }
+
+  const path = `${getConnectionsCollectionPath()}/${platformName}`;
+
+  try {
+    await firebaseRequest(path, {
+      method: "DELETE"
+    });
+
+    return true;
+  } catch (error) {
+    if (String(error.message || "").includes("NOT_FOUND")) {
+      return true;
+    }
+
+    throw error;
+  }
 }

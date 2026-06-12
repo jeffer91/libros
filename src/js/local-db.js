@@ -4,25 +4,29 @@ Nombre completo: local-db.js
 Ruta o ubicación: /src/js/local-db.js
 
 Función o funciones:
-1. Guardar eventos y pendientes localmente.
-2. Permitir que la app funcione sin internet.
-3. Guardar cola de sincronización.
-4. Guardar configuraciones locales.
-5. Recuperar datos al abrir la app.
+1. Guardar eventos y pendientes de AgendaJeff de forma local.
+2. Leer eventos guardados al abrir nuevamente la app.
+3. Mantener persistencia real con IndexedDB.
+4. Usar localStorage como respaldo si IndexedDB falla.
+5. Guardar configuraciones locales y cola de sincronización.
+6. Evitar que la carga masiva se pierda al cerrar la app.
+7. Borrar duplicados locales en lote.
 
 Con qué se conecta:
-- src/js/events.js
 - src/js/sync-service.js
-- src/js/settings.js
-- src/js/firebase-service.js
+- src/js/app.js
+- src/js/bulk-preview.js
+- src/js/events.js
+- src/js/duplicate-service.js
 
 Para qué sirve:
-Sirve como base local de AgendaJeff usando IndexedDB.
+Sirve como base local persistente de AgendaJeff. Todo evento debe guardarse aquí
+antes de enviarse a Firebase, Google, Microsoft, Telegram o notificaciones de PC.
 =========================================================
 */
 
 const DB_NAME = "AgendaJeffDB";
-const DB_VERSION = 1;
+const DB_VERSION = 6;
 
 const STORES = {
   ITEMS: "items",
@@ -30,207 +34,689 @@ const STORES = {
   SYNC_QUEUE: "syncQueue"
 };
 
-let dbInstance = null;
+const LOCAL_STORAGE_KEYS = {
+  ITEMS: "agendaJeff.items",
+  SETTINGS: "agendaJeff.settings",
+  SYNC_QUEUE: "agendaJeff.syncQueue"
+};
 
-export function openLocalDB() {
-  if (dbInstance) {
-    return Promise.resolve(dbInstance);
+let dbPromise = null;
+
+function hasIndexedDB() {
+  return typeof window !== "undefined" && Boolean(window.indexedDB);
+}
+
+function nowISO() {
+  return new Date().toISOString();
+}
+
+function createId(prefix = "item") {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
   }
 
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
-    request.onupgradeneeded = () => {
+function safeJSONParse(value, fallback) {
+  try {
+    return JSON.parse(value);
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function readLocalStorageArray(key) {
+  if (typeof localStorage === "undefined") {
+    return [];
+  }
+
+  return safeJSONParse(localStorage.getItem(key), []);
+}
+
+function writeLocalStorageArray(key, value = []) {
+  if (typeof localStorage === "undefined") {
+    return;
+  }
+
+  localStorage.setItem(key, JSON.stringify(Array.isArray(value) ? value : []));
+}
+
+function readLocalStorageObject(key) {
+  if (typeof localStorage === "undefined") {
+    return {};
+  }
+
+  return safeJSONParse(localStorage.getItem(key), {});
+}
+
+function writeLocalStorageObject(key, value = {}) {
+  if (typeof localStorage === "undefined") {
+    return;
+  }
+
+  localStorage.setItem(key, JSON.stringify(value && typeof value === "object" ? value : {}));
+}
+
+function requestToPromise(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Error en IndexedDB."));
+  });
+}
+
+function transactionDone(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve(true);
+    transaction.onerror = () => reject(transaction.error || new Error("Error en transacción local."));
+    transaction.onabort = () => reject(transaction.error || new Error("Transacción local cancelada."));
+  });
+}
+
+function ensureIndex(store, indexName, keyPath, options = {}) {
+  if (!store.indexNames.contains(indexName)) {
+    store.createIndex(indexName, keyPath, options);
+  }
+}
+
+function createOrUpgradeStores(db) {
+  if (!db.objectStoreNames.contains(STORES.ITEMS)) {
+    db.createObjectStore(STORES.ITEMS, {
+      keyPath: "id"
+    });
+  }
+
+  if (!db.objectStoreNames.contains(STORES.SETTINGS)) {
+    db.createObjectStore(STORES.SETTINGS, {
+      keyPath: "key"
+    });
+  }
+
+  if (!db.objectStoreNames.contains(STORES.SYNC_QUEUE)) {
+    db.createObjectStore(STORES.SYNC_QUEUE, {
+      keyPath: "id"
+    });
+  }
+}
+
+function upgradeIndexes(event) {
+  const db = event.target.result;
+
+  createOrUpgradeStores(db);
+
+  const transaction = event.target.transaction;
+
+  if (transaction.objectStoreNames.contains(STORES.ITEMS)) {
+    const itemsStore = transaction.objectStore(STORES.ITEMS);
+
+    ensureIndex(itemsStore, "syncStatus", "syncStatus", { unique: false });
+    ensureIndex(itemsStore, "updatedAt", "updatedAt", { unique: false });
+    ensureIndex(itemsStore, "createdAt", "createdAt", { unique: false });
+    ensureIndex(itemsStore, "date", "date", { unique: false });
+    ensureIndex(itemsStore, "type", "type", { unique: false });
+    ensureIndex(itemsStore, "status", "status", { unique: false });
+    ensureIndex(itemsStore, "duplicateKey", "duplicateKey", { unique: false });
+  }
+
+  if (transaction.objectStoreNames.contains(STORES.SYNC_QUEUE)) {
+    const queueStore = transaction.objectStore(STORES.SYNC_QUEUE);
+
+    ensureIndex(queueStore, "type", "type", { unique: false });
+    ensureIndex(queueStore, "itemId", "itemId", { unique: false });
+    ensureIndex(queueStore, "createdAt", "createdAt", { unique: false });
+  }
+}
+
+export async function openLocalDB() {
+  if (!hasIndexedDB()) {
+    return null;
+  }
+
+  if (dbPromise) {
+    return dbPromise;
+  }
+
+  dbPromise = new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onupgradeneeded = upgradeIndexes;
+
+    request.onsuccess = () => {
       const db = request.result;
 
-      if (!db.objectStoreNames.contains(STORES.ITEMS)) {
-        const itemsStore = db.createObjectStore(STORES.ITEMS, {
-          keyPath: "id"
-        });
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+      };
 
-        itemsStore.createIndex("status", "status", { unique: false });
-        itemsStore.createIndex("date", "date", { unique: false });
-        itemsStore.createIndex("syncStatus", "syncStatus", { unique: false });
-      }
-
-      if (!db.objectStoreNames.contains(STORES.SETTINGS)) {
-        db.createObjectStore(STORES.SETTINGS, {
-          keyPath: "key"
-        });
-      }
-
-      if (!db.objectStoreNames.contains(STORES.SYNC_QUEUE)) {
-        const queueStore = db.createObjectStore(STORES.SYNC_QUEUE, {
-          keyPath: "id"
-        });
-
-        queueStore.createIndex("createdAt", "createdAt", { unique: false });
-      }
-    };
-
-    request.onsuccess = () => {
-      dbInstance = request.result;
-      resolve(dbInstance);
+      resolve(db);
     };
 
     request.onerror = () => {
-      reject(request.error);
+      dbPromise = null;
+      reject(request.error || new Error("No se pudo abrir la base local."));
+    };
+
+    request.onblocked = () => {
+      console.warn("IndexedDB está bloqueada por otra ventana de AgendaJeff.");
     };
   });
+
+  return dbPromise;
 }
 
-export async function withStore(storeName, mode, callback) {
+function normalizeLocalItem(item = {}) {
+  const createdAt = item.createdAt || nowISO();
+
+  return {
+    ...item,
+    id: item.id || createId("agenda"),
+    type: item.type || "evento",
+    status: item.status || "activo",
+    syncStatus: item.syncStatus || "pendiente",
+    source: item.source || "manual",
+    createdAt,
+    updatedAt: item.updatedAt || createdAt
+  };
+}
+
+async function idbPut(storeName, value) {
   const db = await openLocalDB();
 
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction(storeName, mode);
-    const store = transaction.objectStore(storeName);
-    const result = callback(store);
+  if (!db) {
+    throw new Error("IndexedDB no disponible.");
+  }
 
-    transaction.oncomplete = () => {
-      resolve(result);
-    };
+  const transaction = db.transaction(storeName, "readwrite");
+  const store = transaction.objectStore(storeName);
 
-    transaction.onerror = () => {
-      reject(transaction.error);
-    };
+  store.put(value);
 
-    transaction.onabort = () => {
-      reject(transaction.error);
-    };
-  });
+  await transactionDone(transaction);
+
+  return value;
 }
 
-export function requestToPromise(request) {
-  return new Promise((resolve, reject) => {
-    request.onsuccess = () => {
-      resolve(request.result);
-    };
+async function idbDelete(storeName, key) {
+  const db = await openLocalDB();
 
-    request.onerror = () => {
-      reject(request.error);
-    };
-  });
-}
+  if (!db) {
+    throw new Error("IndexedDB no disponible.");
+  }
 
-export async function saveLocalItem(item) {
-  await withStore(STORES.ITEMS, "readwrite", (store) => {
-    store.put(item);
-  });
+  const transaction = db.transaction(storeName, "readwrite");
+  const store = transaction.objectStore(storeName);
 
-  return item;
-}
+  store.delete(key);
 
-export async function saveManyLocalItems(items = []) {
-  await withStore(STORES.ITEMS, "readwrite", (store) => {
-    items.forEach((item) => {
-      store.put(item);
-    });
-  });
-
-  return items;
-}
-
-export async function getLocalItem(itemId) {
-  let request;
-
-  await withStore(STORES.ITEMS, "readonly", (store) => {
-    request = store.get(itemId);
-  });
-
-  return requestToPromise(request);
-}
-
-export async function getAllLocalItems() {
-  let request;
-
-  await withStore(STORES.ITEMS, "readonly", (store) => {
-    request = store.getAll();
-  });
-
-  return requestToPromise(request);
-}
-
-export async function deleteLocalItem(itemId) {
-  await withStore(STORES.ITEMS, "readwrite", (store) => {
-    store.delete(itemId);
-  });
+  await transactionDone(transaction);
 
   return true;
 }
 
-export async function clearLocalItems() {
-  await withStore(STORES.ITEMS, "readwrite", (store) => {
-    store.clear();
-  });
+async function idbGetAll(storeName) {
+  const db = await openLocalDB();
 
-  return true;
-}
+  if (!db) {
+    throw new Error("IndexedDB no disponible.");
+  }
 
-export async function getPendingSyncItems() {
-  const allItems = await getAllLocalItems();
-
-  return allItems.filter((item) => {
-    return item.syncStatus === "pendiente" || item.syncStatus === "error";
-  });
-}
-
-export async function saveSetting(key, value) {
-  const record = {
-    key,
-    value,
-    updatedAt: new Date().toISOString()
-  };
-
-  await withStore(STORES.SETTINGS, "readwrite", (store) => {
-    store.put(record);
-  });
-
-  return record;
-}
-
-export async function getSetting(key, fallback = null) {
-  let request;
-
-  await withStore(STORES.SETTINGS, "readonly", (store) => {
-    request = store.get(key);
-  });
+  const transaction = db.transaction(storeName, "readonly");
+  const store = transaction.objectStore(storeName);
+  const request = store.getAll();
 
   const result = await requestToPromise(request);
 
-  return result?.value ?? fallback;
+  return Array.isArray(result) ? result : [];
+}
+
+async function idbGet(storeName, key) {
+  const db = await openLocalDB();
+
+  if (!db) {
+    throw new Error("IndexedDB no disponible.");
+  }
+
+  const transaction = db.transaction(storeName, "readonly");
+  const store = transaction.objectStore(storeName);
+  const request = store.get(key);
+
+  return requestToPromise(request);
+}
+
+export async function saveLocalItem(item = {}) {
+  const record = normalizeLocalItem(item);
+
+  if (!hasIndexedDB()) {
+    const items = readLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS);
+    const index = items.findIndex((current) => current.id === record.id);
+
+    if (index >= 0) {
+      items[index] = record;
+    } else {
+      items.unshift(record);
+    }
+
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, items);
+
+    return record;
+  }
+
+  try {
+    await idbPut(STORES.ITEMS, record);
+    return record;
+  } catch (error) {
+    console.warn("IndexedDB falló al guardar. Se usa localStorage.", error);
+
+    const items = readLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS);
+    const index = items.findIndex((current) => current.id === record.id);
+
+    if (index >= 0) {
+      items[index] = record;
+    } else {
+      items.unshift(record);
+    }
+
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, items);
+
+    return record;
+  }
+}
+
+export async function saveManyLocalItems(items = []) {
+  const normalizedItems = items.map(normalizeLocalItem);
+
+  if (!normalizedItems.length) {
+    return [];
+  }
+
+  if (!hasIndexedDB()) {
+    const currentItems = readLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS);
+    const map = new Map();
+
+    currentItems.forEach((item) => {
+      if (item?.id) {
+        map.set(item.id, item);
+      }
+    });
+
+    normalizedItems.forEach((item) => {
+      map.set(item.id, item);
+    });
+
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, Array.from(map.values()));
+
+    return normalizedItems;
+  }
+
+  try {
+    const db = await openLocalDB();
+    const transaction = db.transaction(STORES.ITEMS, "readwrite");
+    const store = transaction.objectStore(STORES.ITEMS);
+
+    normalizedItems.forEach((item) => {
+      store.put(item);
+    });
+
+    await transactionDone(transaction);
+
+    return normalizedItems;
+  } catch (error) {
+    console.warn("IndexedDB falló al guardar varios registros. Se usa localStorage.", error);
+
+    const currentItems = readLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS);
+    const map = new Map();
+
+    currentItems.forEach((item) => {
+      if (item?.id) {
+        map.set(item.id, item);
+      }
+    });
+
+    normalizedItems.forEach((item) => {
+      map.set(item.id, item);
+    });
+
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, Array.from(map.values()));
+
+    return normalizedItems;
+  }
+}
+
+export async function getAllLocalItems() {
+  if (!hasIndexedDB()) {
+    return readLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS);
+  }
+
+  try {
+    const items = await idbGetAll(STORES.ITEMS);
+
+    return items
+      .filter((item) => item && item.id)
+      .sort((left, right) => {
+        const leftDate = `${left.date || "9999-12-31"} ${left.time || "23:59"}`;
+        const rightDate = `${right.date || "9999-12-31"} ${right.time || "23:59"}`;
+
+        return leftDate.localeCompare(rightDate);
+      });
+  } catch (error) {
+    console.warn("IndexedDB falló al leer. Se usa localStorage.", error);
+
+    return readLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS);
+  }
+}
+
+export async function getLocalItem(itemId) {
+  if (!itemId) {
+    return null;
+  }
+
+  if (!hasIndexedDB()) {
+    const items = readLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS);
+
+    return items.find((item) => item.id === itemId) || null;
+  }
+
+  try {
+    return await idbGet(STORES.ITEMS, itemId);
+  } catch (error) {
+    console.warn("IndexedDB falló al buscar item. Se usa localStorage.", error);
+
+    const items = readLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS);
+
+    return items.find((item) => item.id === itemId) || null;
+  }
+}
+
+export async function deleteLocalItem(itemId) {
+  if (!itemId) {
+    return false;
+  }
+
+  if (!hasIndexedDB()) {
+    const items = readLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS).filter((item) => {
+      return item.id !== itemId;
+    });
+
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, items);
+
+    return true;
+  }
+
+  try {
+    await idbDelete(STORES.ITEMS, itemId);
+    return true;
+  } catch (error) {
+    console.warn("IndexedDB falló al eliminar. Se usa localStorage.", error);
+
+    const items = readLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS).filter((item) => {
+      return item.id !== itemId;
+    });
+
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, items);
+
+    return true;
+  }
+}
+
+export async function deleteManyLocalItems(itemIds = []) {
+  const ids = Array.from(new Set((Array.isArray(itemIds) ? itemIds : []).filter(Boolean)));
+
+  if (!ids.length) {
+    return {
+      ok: true,
+      deleted: 0
+    };
+  }
+
+  if (!hasIndexedDB()) {
+    const idsSet = new Set(ids);
+    const items = readLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS).filter((item) => {
+      return !idsSet.has(item.id);
+    });
+
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, items);
+
+    return {
+      ok: true,
+      deleted: ids.length
+    };
+  }
+
+  try {
+    const db = await openLocalDB();
+    const transaction = db.transaction(STORES.ITEMS, "readwrite");
+    const store = transaction.objectStore(STORES.ITEMS);
+
+    ids.forEach((itemId) => {
+      store.delete(itemId);
+    });
+
+    await transactionDone(transaction);
+
+    return {
+      ok: true,
+      deleted: ids.length
+    };
+  } catch (error) {
+    console.warn("IndexedDB falló al eliminar varios registros. Se usa localStorage.", error);
+
+    const idsSet = new Set(ids);
+    const items = readLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS).filter((item) => {
+      return !idsSet.has(item.id);
+    });
+
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, items);
+
+    return {
+      ok: true,
+      deleted: ids.length
+    };
+  }
+}
+
+export async function replaceAllLocalItems(items = []) {
+  const normalizedItems = items.map(normalizeLocalItem);
+
+  if (!hasIndexedDB()) {
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, normalizedItems);
+
+    return normalizedItems;
+  }
+
+  try {
+    const db = await openLocalDB();
+    const transaction = db.transaction(STORES.ITEMS, "readwrite");
+    const store = transaction.objectStore(STORES.ITEMS);
+
+    store.clear();
+
+    normalizedItems.forEach((item) => {
+      store.put(item);
+    });
+
+    await transactionDone(transaction);
+
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, normalizedItems);
+
+    return normalizedItems;
+  } catch (error) {
+    console.warn("IndexedDB falló al reemplazar registros. Se usa localStorage.", error);
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, normalizedItems);
+
+    return normalizedItems;
+  }
+}
+
+export async function getPendingSyncItems() {
+  const items = await getAllLocalItems();
+
+  return items.filter((item) => {
+    const status = String(item.syncStatus || "").toLowerCase();
+
+    return status === "pendiente" || status === "pending" || status === "error";
+  });
+}
+
+export async function clearLocalItems() {
+  if (!hasIndexedDB()) {
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, []);
+    return true;
+  }
+
+  try {
+    const db = await openLocalDB();
+    const transaction = db.transaction(STORES.ITEMS, "readwrite");
+    const store = transaction.objectStore(STORES.ITEMS);
+
+    store.clear();
+
+    await transactionDone(transaction);
+
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, []);
+
+    return true;
+  } catch (error) {
+    console.warn("IndexedDB falló al limpiar. Se limpia localStorage.", error);
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.ITEMS, []);
+
+    return true;
+  }
+}
+
+export async function saveSetting(key, value) {
+  if (!key) {
+    throw new Error("No se puede guardar una configuración sin clave.");
+  }
+
+  const record = {
+    key,
+    value,
+    updatedAt: nowISO()
+  };
+
+  if (!hasIndexedDB()) {
+    const settings = readLocalStorageObject(LOCAL_STORAGE_KEYS.SETTINGS);
+
+    settings[key] = record;
+    writeLocalStorageObject(LOCAL_STORAGE_KEYS.SETTINGS, settings);
+
+    return record;
+  }
+
+  try {
+    await idbPut(STORES.SETTINGS, record);
+    return record;
+  } catch (error) {
+    console.warn("IndexedDB falló al guardar configuración. Se usa localStorage.", error);
+
+    const settings = readLocalStorageObject(LOCAL_STORAGE_KEYS.SETTINGS);
+
+    settings[key] = record;
+    writeLocalStorageObject(LOCAL_STORAGE_KEYS.SETTINGS, settings);
+
+    return record;
+  }
+}
+
+export async function getSetting(key, fallback = null) {
+  if (!key) {
+    return fallback;
+  }
+
+  if (!hasIndexedDB()) {
+    const settings = readLocalStorageObject(LOCAL_STORAGE_KEYS.SETTINGS);
+
+    return settings[key]?.value ?? fallback;
+  }
+
+  try {
+    const record = await idbGet(STORES.SETTINGS, key);
+
+    return record?.value ?? fallback;
+  } catch (error) {
+    console.warn("IndexedDB falló al leer configuración. Se usa localStorage.", error);
+
+    const settings = readLocalStorageObject(LOCAL_STORAGE_KEYS.SETTINGS);
+
+    return settings[key]?.value ?? fallback;
+  }
 }
 
 export async function enqueueSyncJob(job = {}) {
   const record = {
-    id: job.id || `sync-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    id: job.id || createId("sync"),
     type: job.type || "upsert",
     itemId: job.itemId || null,
     payload: job.payload || null,
-    createdAt: new Date().toISOString()
+    createdAt: job.createdAt || nowISO()
   };
 
-  await withStore(STORES.SYNC_QUEUE, "readwrite", (store) => {
-    store.put(record);
-  });
+  if (!hasIndexedDB()) {
+    const queue = readLocalStorageArray(LOCAL_STORAGE_KEYS.SYNC_QUEUE);
 
-  return record;
+    queue.push(record);
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.SYNC_QUEUE, queue);
+
+    return record;
+  }
+
+  try {
+    await idbPut(STORES.SYNC_QUEUE, record);
+    return record;
+  } catch (error) {
+    console.warn("IndexedDB falló al encolar sync. Se usa localStorage.", error);
+
+    const queue = readLocalStorageArray(LOCAL_STORAGE_KEYS.SYNC_QUEUE);
+
+    queue.push(record);
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.SYNC_QUEUE, queue);
+
+    return record;
+  }
 }
 
 export async function getSyncQueue() {
-  let request;
+  if (!hasIndexedDB()) {
+    return readLocalStorageArray(LOCAL_STORAGE_KEYS.SYNC_QUEUE);
+  }
 
-  await withStore(STORES.SYNC_QUEUE, "readonly", (store) => {
-    request = store.getAll();
-  });
+  try {
+    return await idbGetAll(STORES.SYNC_QUEUE);
+  } catch (error) {
+    console.warn("IndexedDB falló al leer cola. Se usa localStorage.", error);
 
-  return requestToPromise(request);
+    return readLocalStorageArray(LOCAL_STORAGE_KEYS.SYNC_QUEUE);
+  }
 }
 
 export async function deleteSyncJob(jobId) {
-  await withStore(STORES.SYNC_QUEUE, "readwrite", (store) => {
-    store.delete(jobId);
-  });
+  if (!jobId) {
+    return false;
+  }
 
-  return true;
+  if (!hasIndexedDB()) {
+    const queue = readLocalStorageArray(LOCAL_STORAGE_KEYS.SYNC_QUEUE).filter((job) => {
+      return job.id !== jobId;
+    });
+
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.SYNC_QUEUE, queue);
+
+    return true;
+  }
+
+  try {
+    await idbDelete(STORES.SYNC_QUEUE, jobId);
+    return true;
+  } catch (error) {
+    console.warn("IndexedDB falló al eliminar job. Se usa localStorage.", error);
+
+    const queue = readLocalStorageArray(LOCAL_STORAGE_KEYS.SYNC_QUEUE).filter((job) => {
+      return job.id !== jobId;
+    });
+
+    writeLocalStorageArray(LOCAL_STORAGE_KEYS.SYNC_QUEUE, queue);
+
+    return true;
+  }
 }
