@@ -1,0 +1,24 @@
+{
+  "name": "libros-guias-app",
+  "private": true,
+  "version": "0.1.0",
+  "main": "electron-main.js",
+  "scripts": {
+    "dev": "vite",
+    "electron": "wait-on http://localhost:5173 && electron .",
+    "start": "concurrently -k \"npm run dev\" \"npm run electron\"",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "xlsx": "latest"
+  },
+  "devDependencies": {
+    "concurrently": "latest",
+    "electron": "latest",
+    "wait-on": "latest"
+  }
+}
